@@ -57,6 +57,7 @@ use flume::{Receiver, Sender};
 use loki_api::logproto as loki;
 use loki_api::prost;
 use serde::Serialize;
+use std::cmp;
 use std::collections::HashMap;
 use std::error;
 use std::fmt;
@@ -373,6 +374,10 @@ impl SendQueue {
         self.sending.clear();
         len
     }
+    fn on_send_err(&mut self) {
+        self.sending.append(&mut self.to_send);
+        mem::swap(&mut self.sending, &mut self.to_send);
+    }
 
     fn prepare_sending(&mut self) -> loki::StreamAdapter {
         if !self.sending.is_empty() {
@@ -430,6 +435,7 @@ pub struct BackgroundTask {
     buffer: Buffer,
     http_client: reqwest::Client,
     backoff: Duration,
+    backoff_count: u32,
 }
 
 impl BackgroundTask {
@@ -465,7 +471,24 @@ impl BackgroundTask {
                 .build()
                 .expect("reqwest client builder"),
             backoff,
+            backoff_count: 0,
         })
+    }
+
+    fn backoff_time(&self) -> (bool, Duration) {
+        let backoff_time = if self.backoff_count >= 1 {
+            Duration::from_millis(
+                500u64
+                    .checked_shl(self.backoff_count - 1)
+                    .unwrap_or(u64::MAX),
+            )
+        } else {
+            Duration::from_millis(0)
+        };
+        (
+            backoff_time >= Duration::from_secs(30),
+            cmp::min(backoff_time, Duration::from_secs(600)),
+        )
     }
 
     /// Does something
@@ -496,22 +519,51 @@ impl BackgroundTask {
                 .encode(&loki::PushRequest { streams })
                 .to_owned();
             let request_builder = self.http_client.post(self.loki_url.clone());
-            if let Ok(res) = request_builder
+            let mut backoff = self.backoff;
+            match request_builder
                 .header(reqwest::header::CONTENT_TYPE, "application/x-snappy")
                 .body(body)
                 .send()
                 .await
+                .and_then(|r| r.error_for_status())
             {
-                if let Err(e) = res.error_for_status() {
-                    tracing::error!("Cannot send {e:?}");
+                Ok(_) => {
+                    self.backoff_count = 0;
+                }
+                Err(e) => {
+                    // Error sending to loki
+                    let (drop_outstanding, backoff_time) = self.backoff_time();
+                    // tracing::error!(
+                    //     error_count = self.backoff_count + 1,
+                    //     ?backoff_time,
+                    //     error = %e,
+                    //     "couldn't send logs to loki",
+                    // );
+                    if drop_outstanding {
+                        let num_dropped: usize =
+                            self.queues.values_mut().map(|q| q.drop_outstanding()).sum();
+                        tracing::error!(
+                            num_dropped,
+                            error_count = self.backoff_count + 1,
+                            ?backoff_time,
+                            error = %e,
+                            "dropped outstanding messages due to sending errors",
+                        );
+                    }
+                    self.backoff_count += 1;
+                    backoff = backoff + backoff_time;
+                    for q in self.queues.values_mut() {
+                        q.on_send_err();
+                    }
                 }
             }
+
             // drop sent messages
             self.queues.values_mut().for_each(|q| {
                 q.drop_outstanding();
             });
             // sleep before next iteration
-            tokio::time::sleep(self.backoff).await;
+            tokio::time::sleep(backoff).await;
         }
     }
 }
